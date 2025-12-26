@@ -8,7 +8,7 @@ import torch
 import re
 from typing import Optional, Dict
 from typing import List
-app = FastAPI(title="AI Image Metadata Extractor")
+app = FastAPI(title="AI Image Metadata API", version="1.0")
 
 print("Loading AI Model... please wait.")
 processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
