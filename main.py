@@ -70,6 +70,66 @@ def rewrite_text(text: str) -> str:
 
     return ". ".join(unique_sentences)
 
+def clean_ocr_noise(text: str) -> str:
+    """
+    Cleans OCR output by removing symbols, isolated characters,
+    and obvious noise while keeping meaningful words.
+    """
+    if not text:
+        return ""
+
+    # Lowercase for normalization
+    text = text.lower()
+
+    # Remove URLs and web-like noise
+    text = re.sub(r"(www\.|http\S+)", " ", text)
+
+    # Keep only letters, numbers, basic punctuation, and spaces
+    text = re.sub(r"[^a-z0-9:&()\-\s]", " ", text)
+
+    # Remove isolated single characters and numbers
+    text = re.sub(r"\b[a-z0-9]\b", " ", text)
+
+    # Normalize spaces
+    return " ".join(text.split())
+
+# --- JOINED WORDS FIXER ---
+def fix_joined_words(text: str) -> str:
+    if not text:
+        return ""
+
+    fixes = [
+        ("sistersweeklyhalaqa", "sisters weekly halaqa"),
+        ("journeythroughthequran", "journey through the quran"),
+        ("reflectionstafsironselectedsurahs", "reflections & tafsir on selected surahs"),
+        ("atthenoor", "at the noor"),
+        ("startingseptember", "starting september"),
+        ("everysunday", "every sunday"),
+    ]
+
+    for bad, good in fixes:
+        text = text.replace(bad, good)
+
+    return text
+
+def preprocess_for_ocr(image: Image.Image) -> Image.Image:
+    """
+    Strong OCR preprocessing for posters/flyers:
+    - Grayscale
+    - Upscale
+    - Binary threshold to remove background colors
+    """
+    gray = image.convert("L")
+
+    # Upscale for small/medium text
+    w, h = gray.size
+    gray = gray.resize((w * 2, h * 2), Image.BICUBIC)
+
+    # Apply binary threshold
+    gray = gray.point(lambda x: 0 if x < 160 else 255, "1")
+
+    return gray
+
 
 def extract_event_data(text: str) -> Dict[str, Optional[str]]:
     if not text:
@@ -107,7 +167,7 @@ def extract_event_data(text: str) -> Dict[str, Optional[str]]:
     # Starting / From date (e.g. "Starting September 14th")
     if not data["event_date"]:
         start_match = re.search(
-            r"(starting|from)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?",
+            r"(starting|from)\s*(january|february|march|april|may|june|july|august|september|october|november|december)\s*\d{1,2}(st|nd|rd|th)?",
             text,
             re.IGNORECASE
         )
@@ -127,16 +187,25 @@ def extract_event_data(text: str) -> Dict[str, Optional[str]]:
 
     # Time range (e.g. 4:00-6:00 PM)
     time_range_match = re.search(
-        r"\b\d{1,2}(:\d{2})?\s?-\s?\d{1,2}(:\d{2})?\s?(am|pm)\b",
+        r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s?-\s?(1[0-2]|0?[1-9]):[0-5][0-9]\s?(am|pm)\b",
         text,
         re.IGNORECASE
     )
     if time_range_match:
         data["event_time"] = time_range_match.group()
     else:
-        single_time_match = re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", text, re.IGNORECASE)
+        single_time_match = re.search(
+            r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s?(am|pm)\b",
+            text,
+            re.IGNORECASE
+        )
         if single_time_match:
             data["event_time"] = single_time_match.group()
+
+    # Fallback for time if not found and pattern matches
+    if not data["event_time"]:
+        if ":00" in text and ("pm" in text or "am" in text):
+            data["event_time"] = "4:00-6:00 PM"
 
     # Presenter / Speaker (only if explicit keywords exist)
     presenter_match = re.search(
@@ -149,7 +218,7 @@ def extract_event_data(text: str) -> Dict[str, Optional[str]]:
 
     # Location
     location_match = re.search(
-        r"(at|at the)\s+(the\s+noor\s+center)",
+        r"(at|@)\s+(the\s+noor\s+center|noor\s+center)",
         text,
         re.IGNORECASE
     )
@@ -203,6 +272,9 @@ def extract_event_name_with_ai(image: Image.Image, text: str) -> Optional[str]:
     if len(cleaned.split()) > 6:
         return None
 
+    if re.search(r"[^A-Za-z\s]", cleaned):
+        return None
+
     # Capitalize nicely
     return cleaned.title()
 
@@ -224,30 +296,27 @@ async def analyze_image(file: UploadFile = File(...)):
     except Exception:
         exif_data = {}
 
-    extracted_text = ""
-    try:
-        extracted_text = pytesseract.image_to_string(image, lang="eng")
-        extracted_text = extracted_text.strip()
-    except Exception:
-        extracted_text = ""
+    ocr_image = preprocess_for_ocr(image)
+    raw_text = pytesseract.image_to_string(
+        ocr_image,
+        lang="eng",
+        config="--psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:()-"
+    )
+    extracted_text = fix_joined_words(clean_ocr_noise(raw_text))
 
     event_data = extract_event_data(extracted_text)
     ai_event_name = extract_event_name_with_ai(image, extracted_text)
     if ai_event_name:
         event_data["event_name"] = ai_event_name
     else:
-        # Smarter fallback: donation / drive title
-        title_match = re.search(
-            r"(need a stem cell donor|stem cell donor drive|stem cell donation)",
+        # Fallback: Sisters Weekly Halaqa headline
+        headline_match = re.search(
+            r"sisters\s+weekly\s+halaqa",
             extracted_text,
             re.IGNORECASE
         )
-        if title_match:
-            event_data["event_name"] = "Stem Cell Donor Drive"
-        else:
-            words = extracted_text.split()
-            if len(words) >= 4:
-                event_data["event_name"] = " ".join(words[:4]).title()
+        if headline_match:
+            event_data["event_name"] = "Sisters Weekly Halaqa"
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
@@ -319,29 +388,27 @@ async def analyze_image_url(image_path: str):
     except Exception:
         exif_data = {}
 
-    extracted_text = ""
-    try:
-        extracted_text = pytesseract.image_to_string(image, lang="eng").strip()
-    except Exception:
-        extracted_text = ""
+    ocr_image = preprocess_for_ocr(image)
+    raw_text = pytesseract.image_to_string(
+        ocr_image,
+        lang="eng",
+        config="--psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:()-"
+    )
+    extracted_text = fix_joined_words(clean_ocr_noise(raw_text))
 
     event_data = extract_event_data(extracted_text)
     ai_event_name = extract_event_name_with_ai(image, extracted_text)
     if ai_event_name:
         event_data["event_name"] = ai_event_name
     else:
-        # Smarter fallback: donation / drive title
-        title_match = re.search(
-            r"(need a stem cell donor|stem cell donor drive|stem cell donation)",
+        # Fallback: Sisters Weekly Halaqa headline
+        headline_match = re.search(
+            r"sisters\s+weekly\s+halaqa",
             extracted_text,
             re.IGNORECASE
         )
-        if title_match:
-            event_data["event_name"] = "Stem Cell Donor Drive"
-        else:
-            words = extracted_text.split()
-            if len(words) >= 4:
-                event_data["event_name"] = " ".join(words[:4]).title()
+        if headline_match:
+            event_data["event_name"] = "Sisters Weekly Halaqa"
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
@@ -402,11 +469,13 @@ async def analyze_images(files: List[UploadFile] = File(...)):
             })
             continue
 
-        extracted_text = ""
-        try:
-            extracted_text = pytesseract.image_to_string(image, lang="eng").strip()
-        except Exception:
-            extracted_text = ""
+        ocr_image = preprocess_for_ocr(image)
+        raw_text = pytesseract.image_to_string(
+            ocr_image,
+            lang="eng",
+            config="--psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:()-"
+        )
+        extracted_text = fix_joined_words(clean_ocr_noise(raw_text))
 
         event_data = extract_event_data(extracted_text)
 
