@@ -1,11 +1,17 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
+
+# Image & OCR
 pillow==10.1.0
 pytesseract==0.3.10
-transformers==4.36.0
+
+# AI / ML
 torch==2.5.0
 torchvision==0.20.0
 torchaudio==2.5.0
+transformers==4.36.0
+
+# Utilities
 requests==2.31.0
 python-multipart==0.0.6
 psutil==5.9.6

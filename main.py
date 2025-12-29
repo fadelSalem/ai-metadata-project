@@ -13,18 +13,52 @@ import torch
 import re
 from typing import Optional, Dict
 from typing import List
+
+_blip_model = None
+_blip_processor = None
+
+def get_blip():
+    global _blip_model, _blip_processor
+
+    if _blip_model is None or _blip_processor is None:
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        import torch
+
+        _blip_processor = BlipProcessor.from_pretrained(
+            "Salesforce/blip-image-captioning-base"
+        )
+        _blip_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base",
+            torch_dtype=torch.float32
+        )
+        _blip_model.eval()
+
+    return _blip_processor, _blip_model
+
+# Lazy-loaded ViT classification model
+_vit_extractor = None
+_vit_model = None
+
+def get_vit():
+    global _vit_extractor, _vit_model
+
+    if _vit_extractor is None or _vit_model is None:
+        from transformers import ViTFeatureExtractor, ViTForImageClassification
+
+        print("Loading Image Classification Model (ViT)...")
+        _vit_extractor = ViTFeatureExtractor.from_pretrained(
+            "google/vit-base-patch16-224"
+        )
+        _vit_model = ViTForImageClassification.from_pretrained(
+            "google/vit-base-patch16-224"
+        )
+        _vit_model.eval()
+        print("Classification Model Loaded Successfully!")
+
+    return _vit_extractor, _vit_model
+
 app = FastAPI(title="AI Image Metadata API", version="1.0")
 
-print("Loading AI Model... please wait.")
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-print("Model Loaded Successfully!")
-
-print("Loading Image Classification Model...")
-classifier_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224")
-classifier_model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
-classifier_model.eval()
-print("Classification Model Loaded Successfully!")
 print("OCR Engine Ready (pytesseract)")
 
 def detect_document_type(text: str, main_object: str) -> str:
@@ -177,6 +211,7 @@ def extract_event_name_with_ai(image: Image.Image, text: str) -> Optional[str]:
     """
     if image is None:
         return None
+    processor, model = get_blip()
 
     prompt = "What is the title of this event?"
 
@@ -247,16 +282,18 @@ async def analyze_image(file: UploadFile = File(...)):
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
+    processor, model = get_blip()
     inputs = processor(image, return_tensors="pt")
     out = model.generate(**inputs)
     ai_description = processor.decode(out[0], skip_special_tokens=True)
 
     with torch.no_grad():
-        cls_inputs = classifier_extractor(images=image, return_tensors="pt")
-        outputs = classifier_model(**cls_inputs)
+        extractor, vit_model = get_vit()
+        cls_inputs = extractor(images=image, return_tensors="pt")
+        outputs = vit_model(**cls_inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=1)
         confidence, predicted_class = torch.max(probs, dim=1)
-        main_object = classifier_model.config.id2label[predicted_class.item()]
+        main_object = vit_model.config.id2label[predicted_class.item()]
 
     top_objects = [{"label": main_object, "confidence": round(confidence.item(), 3)}]
 
@@ -335,16 +372,18 @@ async def analyze_image_url(image_path: str):
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
+    processor, model = get_blip()
     inputs = processor(image, return_tensors="pt")
     out = model.generate(**inputs)
     ai_description = processor.decode(out[0], skip_special_tokens=True)
 
     with torch.no_grad():
-        cls_inputs = classifier_extractor(images=image, return_tensors="pt")
-        outputs = classifier_model(**cls_inputs)
+        extractor, vit_model = get_vit()
+        cls_inputs = extractor(images=image, return_tensors="pt")
+        outputs = vit_model(**cls_inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=1)
         confidence, predicted_class = torch.max(probs, dim=1)
-        main_object = classifier_model.config.id2label[predicted_class.item()]
+        main_object = vit_model.config.id2label[predicted_class.item()]
 
     top_objects = [{"label": main_object, "confidence": round(confidence.item(), 3)}]
 
