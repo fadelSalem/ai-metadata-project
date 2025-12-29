@@ -3,11 +3,22 @@ from transformers import BlipProcessor, BlipForConditionalGeneration, ViTFeature
 from PIL import Image
 import io
 import pytesseract
-import shutil
 
-tesseract_path = shutil.which("tesseract")
-if tesseract_path:
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+import shutil
+import pytesseract
+
+possible_paths = [
+    "/usr/bin/tesseract",       # Linux Ubuntu
+    "/opt/homebrew/bin/tesseract"  # Mac
+]
+
+for path in possible_paths:
+    if shutil.which(path):
+        pytesseract.pytesseract.tesseract_cmd = path
+        print(f"Tesseract path set to: {path}")
+        break
+else:
+    raise EnvironmentError("Tesseract not found! Please install it and ensure it's in PATH.")
 import requests
 import torch
 import re
