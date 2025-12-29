@@ -95,12 +95,17 @@ def rewrite_text(text: str) -> str:
     - Normalizes spaces and newlines
     - Capitalizes sentences
     - Removes duplicate lines
+    - Removes unwanted symbols
     """
     if not text:
         return ""
 
+    # Remove unwanted symbols except common punctuation
+    import re
+    cleaned = re.sub(r"[^A-Za-z0-9\s.,:;\'\"\-\(\)]", "", text)
+
     # Normalize whitespace
-    cleaned = " ".join(text.split())
+    cleaned = " ".join(cleaned.split())
 
     # Split into sentences (simple heuristic)
     sentences = [s.strip().capitalize() for s in cleaned.split(".") if s.strip()]
@@ -136,77 +141,81 @@ def extract_event_data(text: str) -> Dict[str, Optional[str]]:
         "address": None
     }
 
-    # Date patterns (English only)
-    date_patterns = [
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-        r"\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{2,4}\b",
-        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b"
-    ]
-
-    for pattern in date_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            data["event_date"] = match.group()
-            break
-
-    # Starting / From date (e.g. "Starting September 14th")
-    if not data["event_date"]:
-        start_match = re.search(
-            r"(starting|from)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?",
-            text,
+    # Flexible regex to capture start dates without using dateparser
+    start_match = re.search(
+        r"(starting|starts|from|beginning|launching|commencing|held\s+on)\s+(?:\w+\s+){0,3}"
+        r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|"
+        r"september|sep|october|oct|november|nov|december|dec)\s+\d{1,2}(st|nd|rd|th)?",
+        text,
+        re.IGNORECASE
+    )
+    if start_match:
+        # Extract only the month and day
+        month_day_match = re.search(
+            r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|"
+            r"september|sep|october|oct|november|nov|december|dec)\s+\d{1,2}(st|nd|rd|th)?",
+            start_match.group(0),
             re.IGNORECASE
         )
-        if start_match:
-            data["event_date"] = start_match.group()
+        if month_day_match:
+            data["event_date"] = month_day_match.group()
 
-    # Explicit weekday + date (e.g. Friday, July 18)
-    if not data["event_date"]:
-        weekday_date_match = re.search(
-            r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
-            r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}",
-            text,
-            re.IGNORECASE
-        )
-        if weekday_date_match:
-            data["event_date"] = weekday_date_match.group()
-
-    # Time range (e.g. 4:00-6:00 PM)
+    # Enhanced time extraction without duplication
+    # First, try to match standard ranges like 11:00 am-12:00 pm
     time_range_match = re.search(
-        r"\b\d{1,2}(:\d{2})?\s?-\s?\d{1,2}(:\d{2})?\s?(am|pm)\b",
+        r"\b\d{1,2}(:\d{2})?\s?(am|pm)?\s*[-–to]+\s*\d{1,2}(:\d{2})?\s?(am|pm)\b",
         text,
         re.IGNORECASE
     )
     if time_range_match:
         data["event_time"] = time_range_match.group()
     else:
-        single_time_match = re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", text, re.IGNORECASE)
-        if single_time_match:
-            data["event_time"] = single_time_match.group()
+        # Only use single times if no range is found
+        single_times = re.findall(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", text, re.IGNORECASE)
+        if single_times:
+            # Use only the first occurrence to avoid duplication
+            times = ["".join(t) for t in single_times]
+            data["event_time"] = times[0]
 
-    # Presenter / Speaker (only if explicit keywords exist)
+    # Presenter / Speaker (flexible extraction)
     presenter_match = re.search(
-        r"(speaker|presented by|with instructor)\s+([A-Za-z\s]{3,})",
+        r"(?:speaker|presented by|with instructor|with|hosted by|by)\s+([A-Za-z\.\-]+\s+[A-Za-z\.\-]+(?:\s+[A-Za-z\.\-]+)*)",
         text,
         re.IGNORECASE
     )
     if presenter_match:
-        data["presenter"] = presenter_match.group(2).strip()
+        data["presenter"] = presenter_match.group(1).strip()
 
-    # Location
+    # Location extraction (flexible)
+    # Location extraction (improved)
     location_match = re.search(
-        r"(at|at the)\s+(the\s+noor\s+center)",
+        r"\b(?:at|at the)\s+([A-Za-z0-9\s\-&']+?)(?:\.|,|;|$|\swith\s|\sjoin\s)",
         text,
         re.IGNORECASE
     )
     if location_match:
-        location_raw = location_match.group(2)
-        location_clean = " ".join(location_raw.split())
+        location_raw = location_match.group(1)
+        # Remove trailing non-alphanumeric characters
+        location_clean = re.sub(r"[^\w\s\-&']", "", location_raw).strip()
         data["location"] = location_clean.title()
-
     # Address (simple heuristic)
     address_match = re.search(r"(address)\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
     if address_match:
         data["address"] = address_match.group(2).strip()
+
+    # Clean extracted fields to remove non-ASCII and unwanted symbols
+    def clean_field(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        # Remove any non-ASCII characters and unwanted symbols, keep letters, numbers, common punctuation and spaces
+        cleaned = re.sub(r"[^\x00-\x7F]", "", value)  # remove non-ASCII
+        cleaned = re.sub(r"[^A-Za-z0-9\s.,:;'\-&()]", "", cleaned)  # remove other unwanted symbols
+        # Normalize whitespace
+        cleaned = " ".join(cleaned.split())
+        return cleaned if cleaned else None
+
+    for key in ["event_name", "presenter", "location", "address"]:
+        data[key] = clean_field(data.get(key))
 
     return data
 
@@ -282,14 +291,22 @@ async def analyze_image(file: UploadFile = File(...)):
     if ai_event_name:
         event_data["event_name"] = ai_event_name
     else:
-        # Automatic fallback: infer title from prominent text lines
+        # Robust fallback: ignore lines with symbols, prefer event keywords
         lines = [l.strip() for l in extracted_text.splitlines() if len(l.strip()) > 3]
 
-        if lines:
-            # Prefer short, prominent-looking lines (likely titles)
-            candidates = [l for l in lines if 2 <= len(l.split()) <= 6]
-            title_source = candidates[0] if candidates else lines[0]
-            event_data["event_name"] = title_source.title()
+        # Filter out lines with excessive symbols
+        symbol_filtered = [l for l in lines if not re.search(r"[>@{}\[\]\(\)\-]", l)]
+
+        # Prefer lines with keywords
+        keywords = ["workshop", "program", "event", "seminar", "conference", "class"]
+        keyword_lines = [l for l in symbol_filtered if any(k in l.lower() for k in keywords)]
+
+        if keyword_lines:
+            event_data["event_name"] = keyword_lines[0].title()
+        elif symbol_filtered:
+            event_data["event_name"] = symbol_filtered[0].title()
+        else:
+            event_data["event_name"] = lines[0].title()
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
@@ -374,12 +391,22 @@ async def analyze_image_url(image_path: str):
     if ai_event_name:
         event_data["event_name"] = ai_event_name
     else:
+        # Robust fallback: ignore lines with symbols, prefer event keywords
         lines = [l.strip() for l in extracted_text.splitlines() if len(l.strip()) > 3]
 
-        if lines:
-            candidates = [l for l in lines if 2 <= len(l.split()) <= 6]
-            title_source = candidates[0] if candidates else lines[0]
-            event_data["event_name"] = title_source.title()
+        # Filter out lines with excessive symbols
+        symbol_filtered = [l for l in lines if not re.search(r"[>@{}\[\]\(\)\-]", l)]
+
+        # Prefer lines with keywords
+        keywords = ["workshop", "program", "event", "seminar", "conference", "class"]
+        keyword_lines = [l for l in symbol_filtered if any(k in l.lower() for k in keywords)]
+
+        if keyword_lines:
+            event_data["event_name"] = keyword_lines[0].title()
+        elif symbol_filtered:
+            event_data["event_name"] = symbol_filtered[0].title()
+        else:
+            event_data["event_name"] = lines[0].title()
 
     event_data["location"] = rewrite_location(event_data.get("location"))
 
