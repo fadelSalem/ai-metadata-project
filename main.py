@@ -4,6 +4,10 @@ from PIL import Image
 import io
 import pytesseract
 
+import cv2
+import numpy as np
+from bs4 import BeautifulSoup
+
 import shutil
 import pytesseract
 
@@ -224,6 +228,38 @@ def rewrite_location(value: Optional[str]) -> Optional[str]:
         return None
     return " ".join(value.split()).title()
 
+def extract_qr_data(image: Image.Image):
+    """
+    Extract QR code URLs from image using OpenCV only (no zbar dependency)
+    Supports single or multiple QR codes
+    """
+    open_cv_image = np.array(image)
+
+    detector = cv2.QRCodeDetector()
+
+    # Try multi QR detection first (OpenCV >= 4.7)
+    try:
+        retval, decoded_info, points, _ = detector.detectAndDecodeMulti(open_cv_image)
+        if retval and decoded_info:
+            return [d for d in decoded_info if d]
+    except Exception:
+        pass
+
+    # Fallback to single QR detection
+    data, points, _ = detector.detectAndDecode(open_cv_image)
+    if data:
+        return [data]
+
+    return []
+
+
+def get_page_title(url: str) -> Optional[str]:
+    try:
+        response = requests.get(url, timeout=5)
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.title.string.strip() if soup.title else None
+    except Exception:
+        return None
 def extract_event_name_with_ai(image: Image.Image, text: str) -> Optional[str]:
     """
     Uses BLIP to infer the event title from the IMAGE.
@@ -266,6 +302,15 @@ async def analyze_image(file: UploadFile = File(...)):
 
     image_bytes = await file.read()
     image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+
+    # ---- QR Code Extraction ----
+    qr_links = extract_qr_data(image)
+    qr_results = []
+    for link in qr_links:
+        qr_results.append({
+            "url": link,
+            "title": get_page_title(link)
+        })
     
     exif_data = {}
     try:
@@ -336,6 +381,7 @@ async def analyze_image(file: UploadFile = File(...)):
         enriched_description = ai_description
 
     return {
+        "qr_codes": qr_results,
         "filename": file.filename,
         "basic_metadata": {
             "top_objects": top_objects
@@ -367,6 +413,15 @@ async def analyze_image_url(image_path: str):
             "status": "error",
             "message": "Unable to download or read image from URL"
         }
+
+    # ---- QR Code Extraction ----
+    qr_links = extract_qr_data(image)
+    qr_results = []
+    for link in qr_links:
+        qr_results.append({
+            "url": link,
+            "title": get_page_title(link)
+        })
 
     exif_data = {}
     try:
@@ -436,6 +491,7 @@ async def analyze_image_url(image_path: str):
         enriched_description = ai_description
 
     return {
+        "qr_codes": qr_results,
         "image_path": image_path,
         "basic_metadata": {
             "top_objects": top_objects
