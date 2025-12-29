@@ -381,7 +381,6 @@ async def analyze_image(file: UploadFile = File(...)):
         enriched_description = ai_description
 
     return {
-        "qr_codes": qr_results,
         "filename": file.filename,
         "basic_metadata": {
             "top_objects": top_objects
@@ -396,6 +395,7 @@ async def analyze_image(file: UploadFile = File(...)):
             "has_text": bool(extracted_text)
         },
         "event_data": event_data,
+        "qr_codes": qr_results,
         "status": "Process Completed"
     }
 
@@ -491,7 +491,6 @@ async def analyze_image_url(image_path: str):
         enriched_description = ai_description
 
     return {
-        "qr_codes": qr_results,
         "image_path": image_path,
         "basic_metadata": {
             "top_objects": top_objects
@@ -506,6 +505,7 @@ async def analyze_image_url(image_path: str):
             "has_text": bool(extracted_text)
         },
         "event_data": event_data,
+        "qr_codes": qr_results,
         "status": "Process Completed"
     }
 
