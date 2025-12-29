@@ -1,319 +1,420 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from fastapi import FastAPI, UploadFile, File
+from transformers import BlipProcessor, BlipForConditionalGeneration, ViTFeatureExtractor, ViTForImageClassification
 from PIL import Image
 import io
 import pytesseract
 import shutil
-import requests
-import torch
-import re
-import gc
-import os
-from typing import Optional, Dict, List
-from functools import lru_cache
-
-torch.set_grad_enabled(False)
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = False
 
 tesseract_path = shutil.which("tesseract")
 if tesseract_path:
     pytesseract.pytesseract.tesseract_cmd = tesseract_path
-else:
-    print("Tesseract is not installed. OCR may not work.")
+import requests
+import torch
+import re
+from typing import Optional, Dict
+from typing import List
+app = FastAPI(title="AI Image Metadata API", version="1.0")
 
-app = FastAPI(title="AI Image Metadata API", version="2.0")
+print("Loading AI Model... please wait.")
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+print("Model Loaded Successfully!")
 
-@lru_cache(maxsize=1)
-def load_models():
-    gc.collect()
-    try:
-        processor = BlipProcessor.from_pretrained(
-            "Salesforce/blip-image-captioning-base",
-            cache_dir="./model_cache"
-        )
-        model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base",
-            cache_dir="./model_cache",
-            torch_dtype=torch.float32
-        )
-        model.eval()
-        if torch.cuda.is_available():
-            model = model.cuda()
-        else:
-            model = model.cpu()
-        return processor, model
-    except Exception as e:
-        return None, None
+print("Loading Image Classification Model...")
+classifier_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224")
+classifier_model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
+classifier_model.eval()
+print("Classification Model Loaded Successfully!")
+print("OCR Engine Ready (pytesseract)")
 
-blip_processor, blip_model = load_models()
-
-def detect_document_type(text: str) -> str:
-    if not text:
-        return "unknown"
+def detect_document_type(text: str, main_object: str) -> str:
     text_lower = text.lower()
-    if any(word in text_lower for word in ["invoice", "bill", "total", "amount", "due"]):
+
+    if any(word in text_lower for word in ["invoice", "total", "amount", "due"]):
         return "invoice"
-    if any(word in text_lower for word in ["sale", "offer", "discount", "promotion", "event"]):
+
+    if any(word in text_lower for word in ["sale", "offer", "event", "starting", "every"]):
         return "advertisement"
-    if any(word in text_lower for word in ["post", "announcement", "news", "update"]):
+
+    if any(word in text_lower for word in ["post", "announcement", "update"]):
         return "post"
-    if any(word in text_lower for word in ["card", "business", "contact", "email"]):
-        return "business_card"
-    if any(word in text_lower for word in ["id", "passport", "license", "identification"]):
-        return "id_card"
+
+    if main_object in ["poster", "flyer", "brochure"]:
+        return "advertisement"
+
     return "unknown"
 
-def clean_text(text: str) -> str:
+def rewrite_text(text: str) -> str:
+    """
+    Lightweight rewrite/cleanup for OCR text without using extra AI models.
+    - Normalizes spaces and newlines
+    - Capitalizes sentences
+    - Removes duplicate lines
+    """
     if not text:
         return ""
-    text = " ".join(text.split())
-    text = re.sub(r"[^\w\s.,:;&()\-'\"?!]", " ", text)
-    return text.strip()
 
-def fix_joined_words(text: str) -> str:
-    fixes = [
-        ("sistersweeklyhalaqa", "Sisters Weekly Halaqa"),
-        ("journeythroughthequran", "Journey Through The Quran"),
-        ("atthenoor", "At The Noor"),
-        ("startingseptember", "Starting September"),
-        ("everysunday", "Every Sunday"),
-        ("weeklyhalaqa", "Weekly Halaqa"),
-    ]
-    for bad, good in fixes:
-        text = text.replace(bad, good)
-        text = text.replace(bad.lower(), good.lower())
-    return text
+    # Normalize whitespace
+    cleaned = " ".join(text.split())
 
-def preprocess_image(image: Image.Image) -> Image.Image:
-    gray = image.convert("L")
-    if gray.width < 600 or gray.height < 400:
-        gray = gray.resize((gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS)
-    gray = gray.point(lambda x: 0 if x < 128 else 255, "1")
-    return gray
+    # Split into sentences (simple heuristic)
+    sentences = [s.strip().capitalize() for s in cleaned.split(".") if s.strip()]
 
-def extract_event_info(text: str) -> Dict[str, Optional[str]]:
-    result = {
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_sentences = []
+    for s in sentences:
+        if s not in seen:
+            seen.add(s)
+            unique_sentences.append(s)
+
+    return ". ".join(unique_sentences)
+
+
+def extract_event_data(text: str) -> Dict[str, Optional[str]]:
+    if not text:
+        return {
+            "event_name": None,
+            "event_date": None,
+            "event_time": None,
+            "presenter": None,
+            "location": None,
+            "address": None
+        }
+
+    data = {
         "event_name": None,
         "event_date": None,
         "event_time": None,
+        "presenter": None,
         "location": None,
-        "presenter": None
+        "address": None
     }
-    if not text:
-        return result
-    name_patterns = [
-        r"sisters\s+weekly\s+halaqa",
-        r"journey\s+through\s+the\s+quran",
-        r"event\s*[:\-]?\s*([^\n]{5,50})",
-        r"title\s*[:\-]?\s*([^\n]{5,50})",
-    ]
-    for pattern in name_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            if len(match.groups()) > 0:
-                result["event_name"] = match.group(1).strip()
-            else:
-                result["event_name"] = match.group().strip()
-            break
+
+    # Date patterns (English only)
     date_patterns = [
-        r"\d{1,2}/\d{1,2}/\d{2,4}",
-        r"\d{1,2}-\d{1,2}-\d{2,4}",
-        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}[,.]?\s+\d{4}",
-        r"\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{2,4}\b",
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b"
     ]
+
     for pattern in date_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            result["event_date"] = match.group()
+            data["event_date"] = match.group()
             break
-    time_patterns = [
-        r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s?[-to]\s?(1[0-2]|0?[1-9]):[0-5][0-9]\s?(am|pm)\b",
-        r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s?(am|pm)\b",
-        r"\b\d{1,2}\s?(am|pm)\b",
-    ]
-    for pattern in time_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            result["event_time"] = match.group()
-            break
-    location_match = re.search(r"(at|@|location)\s+([^\n]{3,50})", text, re.IGNORECASE)
+
+    # Starting / From date (e.g. "Starting September 14th")
+    if not data["event_date"]:
+        start_match = re.search(
+            r"(starting|from)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?",
+            text,
+            re.IGNORECASE
+        )
+        if start_match:
+            data["event_date"] = start_match.group()
+
+    # Explicit weekday + date (e.g. Friday, July 18)
+    if not data["event_date"]:
+        weekday_date_match = re.search(
+            r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
+            r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}",
+            text,
+            re.IGNORECASE
+        )
+        if weekday_date_match:
+            data["event_date"] = weekday_date_match.group()
+
+    # Time range (e.g. 4:00-6:00 PM)
+    time_range_match = re.search(
+        r"\b\d{1,2}(:\d{2})?\s?-\s?\d{1,2}(:\d{2})?\s?(am|pm)\b",
+        text,
+        re.IGNORECASE
+    )
+    if time_range_match:
+        data["event_time"] = time_range_match.group()
+    else:
+        single_time_match = re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", text, re.IGNORECASE)
+        if single_time_match:
+            data["event_time"] = single_time_match.group()
+
+    # Presenter / Speaker (only if explicit keywords exist)
+    presenter_match = re.search(
+        r"(speaker|presented by|with instructor)\s+([A-Za-z\s]{3,})",
+        text,
+        re.IGNORECASE
+    )
+    if presenter_match:
+        data["presenter"] = presenter_match.group(2).strip()
+
+    # Location
+    location_match = re.search(
+        r"(at|at the)\s+(the\s+noor\s+center)",
+        text,
+        re.IGNORECASE
+    )
     if location_match:
-        result["location"] = location_match.group(2).strip()
-    speaker_match = re.search(r"(with|by|speaker|presenter)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)", text, re.IGNORECASE)
-    if speaker_match:
-        result["presenter"] = speaker_match.group(2).strip()
-    return result
+        location_raw = location_match.group(2)
+        location_clean = " ".join(location_raw.split())
+        data["location"] = location_clean.title()
 
-def generate_caption(image: Image.Image) -> str:
-    if blip_processor is None or blip_model is None:
-        return "AI model not available"
-    try:
-        if image.width > 512 or image.height > 512:
-            image = image.resize((256, 256), Image.Resampling.LANCZOS)
-        inputs = blip_processor(images=image, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-        with torch.no_grad():
-            output = blip_model.generate(**inputs, max_length=50, num_beams=3)
-        caption = blip_processor.decode(output[0], skip_special_tokens=True)
-        return caption
-    except Exception as e:
-        return "Error generating caption"
+    # Address (simple heuristic)
+    address_match = re.search(r"(address)\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
+    if address_match:
+        data["address"] = address_match.group(2).strip()
 
-@app.post("/analyze")
+    return data
+
+def rewrite_location(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return " ".join(value.split()).title()
+
+def extract_event_name_with_ai(image: Image.Image, text: str) -> Optional[str]:
+    """
+    Uses BLIP to infer the event title from the IMAGE.
+    Includes strong validation and fallback to avoid prompt-echo issues.
+    """
+    if image is None:
+        return None
+
+    prompt = "What is the title of this event?"
+
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    output = model.generate(**inputs, max_new_tokens=15)
+    result = processor.decode(output[0], skip_special_tokens=True)
+
+    if not result:
+        return None
+
+    cleaned = result.strip()
+
+    # Reject prompt-echo or garbage answers
+    banned_phrases = [
+        "what is",
+        "answer with",
+        "event title",
+        "shown in this poster"
+    ]
+    if any(p in cleaned.lower() for p in banned_phrases):
+        return None
+
+    # Reject very long or sentence-like outputs
+    if len(cleaned.split()) > 6:
+        return None
+
+    # Capitalize nicely
+    return cleaned.title()
+
+@app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
-    try:
-        if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-            raise HTTPException(400, "File must be an image")
-        image_data = await file.read()
-        if len(image_data) > 10 * 1024 * 1024:
-            raise HTTPException(400, "Image too large (max 10MB)")
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        metadata = {
-            "filename": file.filename,
-            "dimensions": f"{image.width}x{image.height}",
-            "format": image.format or "Unknown",
-            "size_kb": len(image_data) // 1024
-        }
-        processed_image = preprocess_image(image)
-        try:
-            ocr_text = pytesseract.image_to_string(processed_image, lang='eng')
-            ocr_text = fix_joined_words(clean_text(ocr_text))
-        except:
-            ocr_text = ""
-        caption = generate_caption(image)
-        event_info = extract_event_info(ocr_text)
-        doc_type = detect_document_type(ocr_text)
-        gc.collect()
-        return {
-            "status": "success",
-            "metadata": metadata,
-            "ocr_text": ocr_text,
-            "ai_caption": caption,
-            "document_type": doc_type,
-            "event_info": event_info,
-            "has_text": bool(ocr_text.strip())
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Processing error: {str(e)}")
 
-@app.post("/analyze-url")
-async def analyze_image_url(url: str):
+    image_bytes = await file.read()
+    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    
+    exif_data = {}
     try:
-        if not url.startswith(('http://', 'https://')):
-            url = "https://zaq23store.s3.amazonaws.com/" + url.lstrip('/')
-        response = requests.get(url, timeout=15)
+        exif = image.getexif()
+        if exif:
+            exif_data = {
+                str(k): str(v)
+                for k, v in exif.items()
+                if k in [271, 272, 306]
+            }
+    except Exception:
+        exif_data = {}
+
+    extracted_text = ""
+    try:
+        extracted_text = pytesseract.image_to_string(image, lang="eng")
+        extracted_text = extracted_text.strip()
+    except Exception:
+        extracted_text = ""
+
+    event_data = extract_event_data(extracted_text)
+    ai_event_name = extract_event_name_with_ai(image, extracted_text)
+    if ai_event_name:
+        event_data["event_name"] = ai_event_name
+    else:
+        # Automatic fallback: infer title from prominent text lines
+        lines = [l.strip() for l in extracted_text.splitlines() if len(l.strip()) > 3]
+
+        if lines:
+            # Prefer short, prominent-looking lines (likely titles)
+            candidates = [l for l in lines if 2 <= len(l.split()) <= 6]
+            title_source = candidates[0] if candidates else lines[0]
+            event_data["event_name"] = title_source.title()
+
+    event_data["location"] = rewrite_location(event_data.get("location"))
+
+    inputs = processor(image, return_tensors="pt")
+    out = model.generate(**inputs)
+    ai_description = processor.decode(out[0], skip_special_tokens=True)
+
+    with torch.no_grad():
+        cls_inputs = classifier_extractor(images=image, return_tensors="pt")
+        outputs = classifier_model(**cls_inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=1)
+        confidence, predicted_class = torch.max(probs, dim=1)
+        main_object = classifier_model.config.id2label[predicted_class.item()]
+
+    top_objects = [{"label": main_object, "confidence": round(confidence.item(), 3)}]
+
+    document_type = detect_document_type(
+        extracted_text,
+        top_objects[0]["label"] if top_objects else ""
+    )
+
+    if top_objects:
+        enriched_description = f"A photo of {top_objects[0]['label']}. {ai_description}"
+    else:
+        enriched_description = ai_description
+
+    return {
+        "filename": file.filename,
+        "basic_metadata": {
+            "top_objects": top_objects
+        },
+        "descriptive_metadata": {
+            "ai_generated_caption": enriched_description
+        },
+        "technical_metadata": exif_data,
+        "document_metadata": {
+            "extracted_text": rewrite_text(extracted_text),
+            "document_type": document_type,
+            "has_text": bool(extracted_text)
+        },
+        "event_data": event_data,
+        "status": "Process Completed"
+    }
+
+@app.post("/analyze-image-url")
+async def analyze_image_url(image_path: str):
+    BASE_URL = "https://zaq23store.s3.amazonaws.com/"
+    image_url = BASE_URL + image_path.lstrip("/")
+
+    try:
+        response = requests.get(image_url, timeout=10)
         response.raise_for_status()
-        if len(response.content) > 10 * 1024 * 1024:
-            raise HTTPException(400, "Image too large (max 10MB)")
-        image = Image.open(io.BytesIO(response.content)).convert('RGB')
-        metadata = {
-            "source_url": url,
-            "dimensions": f"{image.width}x{image.height}",
-            "format": image.format or "Unknown"
-        }
-        processed_image = preprocess_image(image)
-        try:
-            ocr_text = pytesseract.image_to_string(processed_image, lang='eng')
-            ocr_text = fix_joined_words(clean_text(ocr_text))
-        except:
-            ocr_text = ""
-        caption = generate_caption(image)
-        event_info = extract_event_info(ocr_text)
-        doc_type = detect_document_type(ocr_text)
-        gc.collect()
+        image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    except Exception:
         return {
-            "status": "success",
-            "metadata": metadata,
-            "ocr_text": ocr_text,
-            "ai_caption": caption,
-            "document_type": doc_type,
-            "event_info": event_info
+            "status": "error",
+            "message": "Unable to download or read image from URL"
         }
-    except requests.RequestException:
-        raise HTTPException(400, "Failed to download image")
-    except Exception as e:
-        raise HTTPException(500, f"Processing error: {str(e)}")
 
-@app.post("/batch-analyze")
-async def batch_analyze(files: List[UploadFile] = File(...)):
+    exif_data = {}
+    try:
+        exif = image.getexif()
+        if exif:
+            exif_data = {
+                str(k): str(v)
+                for k, v in exif.items()
+                if k in [271, 272, 306]
+            }
+    except Exception:
+        exif_data = {}
+
+    extracted_text = ""
+    try:
+        extracted_text = pytesseract.image_to_string(image, lang="eng").strip()
+    except Exception:
+        extracted_text = ""
+
+    event_data = extract_event_data(extracted_text)
+    ai_event_name = extract_event_name_with_ai(image, extracted_text)
+    if ai_event_name:
+        event_data["event_name"] = ai_event_name
+    else:
+        lines = [l.strip() for l in extracted_text.splitlines() if len(l.strip()) > 3]
+
+        if lines:
+            candidates = [l for l in lines if 2 <= len(l.split()) <= 6]
+            title_source = candidates[0] if candidates else lines[0]
+            event_data["event_name"] = title_source.title()
+
+    event_data["location"] = rewrite_location(event_data.get("location"))
+
+    inputs = processor(image, return_tensors="pt")
+    out = model.generate(**inputs)
+    ai_description = processor.decode(out[0], skip_special_tokens=True)
+
+    with torch.no_grad():
+        cls_inputs = classifier_extractor(images=image, return_tensors="pt")
+        outputs = classifier_model(**cls_inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=1)
+        confidence, predicted_class = torch.max(probs, dim=1)
+        main_object = classifier_model.config.id2label[predicted_class.item()]
+
+    top_objects = [{"label": main_object, "confidence": round(confidence.item(), 3)}]
+
+    document_type = detect_document_type(
+        extracted_text,
+        top_objects[0]["label"] if top_objects else ""
+    )
+
+    if top_objects:
+        enriched_description = f"A photo of {top_objects[0]['label']}. {ai_description}"
+    else:
+        enriched_description = ai_description
+
+    return {
+        "image_path": image_path,
+        "basic_metadata": {
+            "top_objects": top_objects
+        },
+        "descriptive_metadata": {
+            "ai_generated_caption": enriched_description
+        },
+        "technical_metadata": exif_data,
+        "document_metadata": {
+            "extracted_text": rewrite_text(extracted_text),
+            "document_type": document_type,
+            "has_text": bool(extracted_text)
+        },
+        "event_data": event_data,
+        "status": "Process Completed"
+    }
+
+@app.post("/analyze-images")
+async def analyze_images(files: List[UploadFile] = File(...)):
     results = []
+
     for file in files:
         try:
-            image_data = await file.read()
-            image = Image.open(io.BytesIO(image_data)).convert('RGB')
-            processed_image = preprocess_image(image)
-            try:
-                ocr_text = pytesseract.image_to_string(processed_image, lang='eng')
-                ocr_text = fix_joined_words(clean_text(ocr_text))
-            except:
-                ocr_text = ""
-            event_info = extract_event_info(ocr_text)
-            results.append({
-                "filename": file.filename,
-                "ocr_text": ocr_text[:200] + "..." if len(ocr_text) > 200 else ocr_text,
-                "event_info": event_info,
-                "status": "success"
-            })
-            gc.collect()
-        except Exception as e:
+            image_bytes = await file.read()
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception:
             results.append({
                 "filename": file.filename,
                 "status": "error",
-                "error": str(e)
+                "message": "Invalid image file"
             })
+            continue
+
+        extracted_text = ""
+        try:
+            extracted_text = pytesseract.image_to_string(image, lang="eng").strip()
+        except Exception:
+            extracted_text = ""
+
+        event_data = extract_event_data(extracted_text)
+
+        results.append({
+            "filename": file.filename,
+            "document_metadata": {
+                "extracted_text": rewrite_text(extracted_text),
+                "has_text": bool(extracted_text)
+            },
+            "event_data": event_data,
+            "status": "processed"
+        })
+
     return {
-        "processed_count": len(results),
+        "count": len(results),
         "results": results
     }
 
-@app.get("/health")
-async def health_check():
-    import psutil
-    process = psutil.Process()
-    return {
-        "status": "healthy",
-        "service": "AI Image Metadata API",
-        "version": "2.0",
-        "memory_usage_mb": round(process.memory_info().rss / 1024 / 1024, 2),
-        "ai_model_loaded": blip_processor is not None,
-        "ocr_available": tesseract_path is not None
-    }
-
 @app.get("/")
-async def root():
-    return {
-        "message": "Welcome to AI Image Metadata API",
-        "version": "2.0",
-        "endpoints": {
-            "POST /analyze": "Analyze a single image",
-            "POST /analyze-url": "Analyze image from URL",
-            "POST /batch-analyze": "Analyze batch of images",
-            "GET /health": "Health check",
-            "GET /docs": "Interactive API docs (Swagger)"
-        },
-        "note": "Optimized for low-memory servers (2GB RAM)"
-    }
-
-@app.on_event("startup")
-async def startup():
-    pass
-
-@app.on_event("shutdown")
-async def shutdown():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+def home():
+    return {"message": "AI Metadata API is running. Go to /docs for testing."}
