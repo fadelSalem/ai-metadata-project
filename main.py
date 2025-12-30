@@ -1,9 +1,8 @@
 from fastapi import FastAPI, UploadFile, File
-from transformers import BlipProcessor, BlipForConditionalGeneration, ViTFeatureExtractor, ViTForImageClassification
 from PIL import Image
 import io
 import pytesseract
-
+import os
 import cv2
 import numpy as np
 from bs4 import BeautifulSoup
@@ -72,7 +71,13 @@ def get_vit():
 
     return _vit_extractor, _vit_model
 
-app = FastAPI(title="AI Image Metadata API", version="1.0")
+ROOT_PATH = os.getenv("ROOT_PATH", "")
+
+app = FastAPI(
+    title="AI Image Metadata API",
+    root_path=ROOT_PATH,
+    version="1.0"
+)
 
 print("OCR Engine Ready (pytesseract)")
 
